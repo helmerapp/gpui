@@ -565,9 +565,32 @@ impl MacWindowState {
 
 unsafe impl Send for MacWindowState {}
 
-pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
+thread_local! {
+    static HOST_WINDOW: std::cell::Cell<id> = const { std::cell::Cell::new(nil) };
+}
+pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>, bool);
 
 impl MacWindow {
+    pub(crate) unsafe fn resume_host_window(window: *mut std::ffi::c_void) {
+        unsafe {
+            let content = NSWindow::contentView(window.cast());
+            let views: id = msg_send![content, subviews];
+            let count: NSUInteger = msg_send![views, count];
+            for index in 0..count {
+                let view: id = msg_send![views, objectAtIndex: index];
+                let ours: BOOL = msg_send![view, isKindOfClass: VIEW_CLASS];
+                if ours == YES { get_window_state(&*view).lock().start_display_link(); }
+            }
+        }
+    }
+    pub(crate) unsafe fn with_host_window<T>(window: *mut std::ffi::c_void, callback: impl FnOnce() -> T) -> T {
+        struct Reset(id);
+        impl Drop for Reset {
+            fn drop(&mut self) { HOST_WINDOW.with(|slot| slot.set(self.0)); }
+        }
+        let _reset = Reset(HOST_WINDOW.with(|slot| slot.replace(window.cast())));
+        callback()
+    }
     pub fn open(
         handle: AnyWindowHandle,
         WindowParams {
@@ -617,13 +640,15 @@ impl MacWindow {
                     | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
             }
 
-            let native_window: id = match kind {
+            let host_window = HOST_WINDOW.with(|slot| slot.replace(nil));
+            let external = !host_window.is_null();
+            let native_window: id = if external { nil } else { match kind {
                 WindowKind::Normal | WindowKind::Floating => msg_send![WINDOW_CLASS, alloc],
                 WindowKind::PopUp => {
                     style_mask |= NSWindowStyleMaskNonactivatingPanel;
                     msg_send![PANEL_CLASS, alloc]
                 }
-            };
+            } };
 
             let display = display_id
                 .and_then(MacDisplay::find_by_id)
@@ -659,13 +684,16 @@ impl MacWindow {
                 NSSize::new(bounds.size.width.0 as f64, bounds.size.height.0 as f64),
             );
 
-            let native_window = native_window.initWithContentRect_styleMask_backing_defer_screen_(
+            let native_window = if external {
+                let _: id = msg_send![host_window, retain];
+                host_window
+            } else { native_window.initWithContentRect_styleMask_backing_defer_screen_(
                 window_rect,
                 style_mask,
                 NSBackingStoreBuffered,
                 NO,
                 target_screen,
-            );
+            ) };
             assert!(!native_window.is_null());
             let () = msg_send![
                 native_window,
@@ -725,13 +753,13 @@ impl MacWindow {
                 select_previous_tab_callback: None,
                 toggle_tab_bar_callback: None,
                 activated_least_once: false,
-            })));
+            })), external);
 
-            (*native_window).set_ivar(
+            if !external { (*native_window).set_ivar(
                 WINDOW_STATE_IVAR,
                 Arc::into_raw(window.0.clone()) as *const c_void,
             );
-            native_window.setDelegate_(native_window);
+            native_window.setDelegate_(native_window); }
             (*native_view).set_ivar(
                 WINDOW_STATE_IVAR,
                 Arc::into_raw(window.0.clone()) as *const c_void,
@@ -856,8 +884,10 @@ impl MacWindow {
             // Although we already specified the position using `initWithContentRect_styleMask_backing_defer_screen_`,
             // the window position might be incorrect if the main screen (the screen that contains the window that has focus)
             //  is different from the primary screen.
-            NSWindow::setFrameTopLeftPoint_(native_window, window_rect.origin);
-            window.0.lock().move_traffic_light();
+            if !external {
+                NSWindow::setFrameTopLeftPoint_(native_window, window_rect.origin);
+                window.0.lock().move_traffic_light();
+            }
 
             pool.drain();
 
@@ -935,6 +965,14 @@ impl Drop for MacWindow {
         this.renderer.destroy();
         let window = this.native_window;
         this.display_link.take();
+        if self.1 {
+            this.input_handler.take();
+            unsafe {
+                let _: () = msg_send![this.native_view.as_ptr(), removeFromSuperview];
+                let _: () = msg_send![window, release];
+            }
+            return;
+        }
         unsafe {
             this.native_window.setDelegate_(nil);
         }

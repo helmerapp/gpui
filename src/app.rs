@@ -183,6 +183,32 @@ impl Application {
         }));
     }
 
+    /// Experimental macOS host adapter. The caller keeps this Application alive.
+    ///
+    /// # Safety
+    /// Call on the main thread, with a live NSWindow owned by the host. Open exactly
+    /// one GPUI window in the callback. Destroy GPUI before releasing the host.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn run_embedded_in_ns_window<F>(self, window: *mut std::ffi::c_void, callback: F) -> Self
+    where F: FnOnce(&mut App) {
+        unsafe { crate::MacWindow::with_host_window(window, || callback(&mut self.0.borrow_mut())); }
+        self
+    }
+
+    /// Start under an existing host event loop, retaining the application.
+    pub fn run_embedded<F>(self, callback: F) -> Self where F: FnOnce(&mut App) {
+        self.0.borrow_mut().update(callback);
+        self
+    }
+
+    /// Resume the display link after the host's window becomes visible.
+    /// # Safety
+    /// Same main-thread and host-lifetime requirements as the embedding entry point.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn resume_embedded_in_ns_window(&self, window: *mut std::ffi::c_void) {
+        unsafe { crate::MacWindow::resume_host_window(window); }
+    }
+
     /// Register a handler to be invoked when the platform instructs the application
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
@@ -754,6 +780,14 @@ impl App {
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {
         self.pending_effects.push_back(Effect::RefreshWindows);
+    }
+
+    /// Open one GPUI surface in a host-owned NSWindow on the main thread.
+    /// # Safety
+    /// The host must keep the NSWindow live until this surface is removed.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn with_embedded_ns_window<T>(&mut self, window: *mut std::ffi::c_void, callback: impl FnOnce(&mut Self) -> T) -> T {
+        unsafe { crate::MacWindow::with_host_window(window, || callback(self)) }
     }
 
     pub(crate) fn update<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {
